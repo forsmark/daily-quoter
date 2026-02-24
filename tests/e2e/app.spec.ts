@@ -71,6 +71,12 @@ test("can generate quote, choose background/font, and lock save until regenerate
   await generateOverlay.getByRole("button", { name: "Close", exact: true }).click();
   await expect(page.getByRole("dialog", { name: "Presentation overlay" })).toHaveCount(0);
 
+  const downloadPromise = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Download PNG" }).click();
+  const download = await downloadPromise;
+  expect(download.suggestedFilename()).toContain("daily-quoter-");
+  expect(download.suggestedFilename()).toContain(".png");
+
   await page.getByRole("button", { name: "Save Selection" }).click();
   await expect(page.getByText(/Saved quote #/)).toBeVisible();
   await expect(page.getByRole("button", { name: "Saved For This Round" })).toBeDisabled();
@@ -123,11 +129,12 @@ test("history supports fullscreen, deleting one entry, and clearing all entries"
 
   await generateAndSaveSelection(page);
   await generateAndSaveSelection(page);
+  await generateAndSaveSelection(page);
 
   await page.getByRole("button", { name: "History" }).click();
 
   const entries = page.locator("[data-history-entry]");
-  await expect(entries).toHaveCount(2);
+  await expect(entries).toHaveCount(3);
 
   const firstEntry = entries.first();
   await firstEntry.getByRole("button", { name: /Full Screen entry #/ }).click();
@@ -137,7 +144,11 @@ test("history supports fullscreen, deleting one entry, and clearing all entries"
   await expect(page.getByRole("dialog", { name: "Presentation overlay" })).toHaveCount(0);
 
   page.once("dialog", (dialog) => dialog.accept());
-  await firstEntry.getByRole("button", { name: /Delete entry #/ }).click();
+  await firstEntry.getByRole("button", { name: "Hide Quote" }).click();
+  await expect(entries).toHaveCount(2);
+
+  page.once("dialog", (dialog) => dialog.accept());
+  await entries.first().getByRole("button", { name: /Delete entry #/ }).click();
   await expect(entries).toHaveCount(1);
 
   page.once("dialog", (dialog) => dialog.accept());

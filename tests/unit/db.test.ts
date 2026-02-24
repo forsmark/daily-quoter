@@ -13,6 +13,9 @@ function resetDbState(path: string): void {
   const db = new Database(path, { create: true });
   db.query("DELETE FROM quote_history").run();
   db.query("DELETE FROM settings").run();
+  db.query("DELETE FROM hidden_quotes").run();
+  db.query("DELETE FROM allowlist_quotes").run();
+  db.query("DELETE FROM daily_cache").run();
   db.close();
 }
 
@@ -171,5 +174,50 @@ describe("quote persistence", () => {
     expect(deletedCount).toBe(2);
     expect(dbModule.getQuoteHistory(10)).toHaveLength(0);
     expect(dbModule.getUsedQuotes().size).toBe(0);
+  });
+
+  test("supports hidden quotes and allowlist", () => {
+    const hiddenAdded = dbModule.addHiddenQuote("Keep things simple.");
+    expect(hiddenAdded).toBe(true);
+    expect(dbModule.getHiddenQuoteSet().has("keep things simple.")).toBe(true);
+
+    const allowSaved = dbModule.addAllowlistQuote({
+      text: "Bias for action.",
+      author: "Team",
+      attribution: "Engineering Principle",
+      sourceUrl: "",
+    });
+    expect(allowSaved).toBe(true);
+    expect(dbModule.getAllowlistQuotes().some((entry) => entry.text === "Bias for action.")).toBe(true);
+
+    const hiddenRemoved = dbModule.removeHiddenQuote("Keep things simple.");
+    expect(hiddenRemoved).toBe(true);
+    expect(dbModule.getHiddenQuoteSet().has("keep things simple.")).toBe(false);
+
+    const allowRemoved = dbModule.removeAllowlistQuote("Bias for action.");
+    expect(allowRemoved).toBe(true);
+  });
+
+  test("supports daily quote/background cache storage", () => {
+    dbModule.setDailyQuoteCache("2026-02-24", [
+      {
+        text: "Optimize for clarity.",
+        author: "Team",
+        attribution: "Standup",
+      },
+    ]);
+    dbModule.setDailyBackgroundCache("2026-02-24", [
+      {
+        id: "bg-cache",
+        name: "Cache Background",
+        imageUrl: "https://example.com/cache.jpg",
+        credit: "Example",
+      },
+    ]);
+
+    const quotes = dbModule.getDailyQuoteCache("2026-02-24");
+    const backgrounds = dbModule.getDailyBackgroundCache("2026-02-24");
+    expect(quotes?.[0]?.text).toBe("Optimize for clarity.");
+    expect(backgrounds?.[0]?.id).toBe("bg-cache");
   });
 });

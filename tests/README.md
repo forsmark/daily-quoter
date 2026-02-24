@@ -4,7 +4,7 @@
 
 - Location: `tests/unit`
 - Runner: `bun test`
-- Focus: database settings/persistence and provider fallback behavior
+- Focus: database settings/persistence, quote quality controls (allowlist/hidden), daily cache storage, and provider behavior
 
 Run:
 
@@ -16,7 +16,7 @@ bun run test:unit
 
 - Location: `tests/e2e`
 - Runner: Playwright
-- Focus: complete UI flow (generate -> background -> font -> overlay presentation -> save lock), settings updates, and history actions (overlay presentation + delete single/all)
+- Focus: complete UI flow (generate -> background -> font -> overlay presentation -> PNG export -> save lock), settings updates, and history actions (overlay presentation + hide + delete single/all)
 
 Run:
 
@@ -29,3 +29,4 @@ bun run test:e2e
 - E2E starts a real server via Playwright `webServer`.
 - E2E runs with `DISABLE_REMOTE_APIS=1` for deterministic fallback data.
 - SQLite is isolated during E2E with `DAILY_QUOTER_DB_PATH=/tmp/daily-quoter-e2e.sqlite`.
+- Optional: set `E2E_PORT` to force the Playwright webServer port.

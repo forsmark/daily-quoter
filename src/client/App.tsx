@@ -12,14 +12,25 @@ type AppSettings = {
 type QuoteGenerateResponse = {
   quotes: Quote[];
   exhausted: boolean;
-  source: "zenquotes" | "fallback";
+  source: "zenquotes" | "fallback" | "cache";
   notice?: string;
 };
 
 type BackgroundResponse = {
   backgrounds: Background[];
-  source: "pexels" | "fallback";
+  source: "pexels" | "fallback" | "cache";
   notice?: string;
+};
+
+type HiddenQuoteEntry = {
+  quote: string;
+  normalizedQuote: string;
+  createdOn: string;
+};
+
+type QuoteControlsResponse = {
+  hiddenQuotes: HiddenQuoteEntry[];
+  allowlistQuotes: Quote[];
 };
 
 type FontResponse = {
@@ -68,6 +79,40 @@ const uiButtonClass =
 const primaryButtonClass =
   "rounded-xl border border-[#9a5217] bg-[#ba6a24] text-white transition-all duration-200 hover:bg-[#9a5217] disabled:cursor-not-allowed disabled:opacity-60";
 const FALLBACK_BACKGROUND_URL = "/backgrounds/sunrise-grid.svg";
+
+function wrapText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string[] {
+  const words = text.split(/\s+/).filter(Boolean);
+  const lines: string[] = [];
+  let current = "";
+
+  for (const word of words) {
+    const next = current ? `${current} ${word}` : word;
+    if (ctx.measureText(next).width <= maxWidth) {
+      current = next;
+      continue;
+    }
+
+    if (current) {
+      lines.push(current);
+    }
+    current = word;
+  }
+
+  if (current) {
+    lines.push(current);
+  }
+
+  return lines.length > 0 ? lines : [text];
+}
+
+function loadImage(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error(`Could not load image: ${src}`));
+    image.src = src;
+  });
+}
 
 function QuotePreview({
   quote,
@@ -187,6 +232,7 @@ function GeneratePage({
   const [localQuoteNotice, setLocalQuoteNotice] = useState<string | null>(null);
   const [isExhausted, setIsExhausted] = useState(false);
   const [isPresentationOpen, setIsPresentationOpen] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [roundLockedAfterSave, setRoundLockedAfterSave] = useState(false);
 
   useEffect(() => {
@@ -263,6 +309,70 @@ function GeneratePage({
 
   async function openFullscreenPreview(): Promise<void> {
     setIsPresentationOpen(true);
+  }
+
+  async function exportSelectionAsPng(): Promise<void> {
+    if (!selectedQuote || !selectedBackground || !selectedFont) {
+      return;
+    }
+
+    setExporting(true);
+    setError(null);
+
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = 1600;
+      canvas.height = 900;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        throw new Error("Canvas rendering not available.");
+      }
+
+      const image = await loadImage(selectedBackground.imageUrl || FALLBACK_BACKGROUND_URL);
+      ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+
+      const gradient = ctx.createLinearGradient(0, 0, 0, canvas.height);
+      gradient.addColorStop(0, "rgba(9, 14, 28, 0.34)");
+      gradient.addColorStop(1, "rgba(9, 14, 28, 0.5)");
+      ctx.fillStyle = gradient;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      const panelWidth = Math.round(canvas.width * 0.72);
+      const panelX = Math.round((canvas.width - panelWidth) / 2);
+      const panelY = 180;
+      const panelHeight = 540;
+
+      ctx.fillStyle = "rgba(17,14,10,0.27)";
+      ctx.fillRect(panelX, panelY, panelWidth, panelHeight);
+
+      ctx.fillStyle = "#fffaf2";
+      ctx.textAlign = "center";
+
+      ctx.font = `700 64px ${selectedFont.family}`;
+      const textLines = wrapText(ctx, selectedQuote.text, panelWidth - 160);
+      const lineHeight = 78;
+      let y = panelY + 130;
+      for (const line of textLines.slice(0, 5)) {
+        ctx.fillText(line, canvas.width / 2, y);
+        y += lineHeight;
+      }
+
+      ctx.font = "700 42px sans-serif";
+      ctx.fillText(selectedQuote.author, canvas.width / 2, panelY + panelHeight - 95);
+
+      ctx.font = "400 30px sans-serif";
+      ctx.fillText(selectedQuote.attribution, canvas.width / 2, panelY + panelHeight - 48);
+
+      const link = document.createElement("a");
+      const datePart = new Date().toISOString().slice(0, 10);
+      link.download = `daily-quoter-${datePart}.png`;
+      link.href = canvas.toDataURL("image/png");
+      link.click();
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Could not export PNG");
+    } finally {
+      setExporting(false);
+    }
   }
 
   async function refreshBackgrounds(): Promise<void> {
@@ -448,6 +558,9 @@ function GeneratePage({
             <button type="button" className={cx(uiButtonClass, "px-4 py-2.5 font-semibold")} onClick={openFullscreenPreview}>
               Full Screen
             </button>
+            <button type="button" className={cx(uiButtonClass, "px-4 py-2.5 font-semibold")} onClick={exportSelectionAsPng} disabled={exporting}>
+              {exporting ? "Exporting..." : "Download PNG"}
+            </button>
           </div>
         </section>
       ) : null}
@@ -482,6 +595,13 @@ function SettingsPage({
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [controls, setControls] = useState<QuoteControlsResponse | null>(null);
+  const [controlsLoading, setControlsLoading] = useState(true);
+  const [controlsError, setControlsError] = useState<string | null>(null);
+  const [allowText, setAllowText] = useState("");
+  const [allowAuthor, setAllowAuthor] = useState("");
+  const [allowAttribution, setAllowAttribution] = useState("");
+  const [savingAllowlist, setSavingAllowlist] = useState(false);
 
   useEffect(() => {
     setQuoteValue(quoteSuggestionCount);
@@ -494,6 +614,35 @@ function SettingsPage({
   useEffect(() => {
     setFontValue(defaultFontId);
   }, [defaultFontId]);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    async function loadControls(): Promise<void> {
+      setControlsLoading(true);
+      setControlsError(null);
+      try {
+        const data = await fetchJson<QuoteControlsResponse>("/api/quotes/controls");
+        if (isMounted) {
+          setControls(data);
+        }
+      } catch (requestError) {
+        if (isMounted) {
+          setControlsError(requestError instanceof Error ? requestError.message : "Could not load quote controls");
+        }
+      } finally {
+        if (isMounted) {
+          setControlsLoading(false);
+        }
+      }
+    }
+
+    void loadControls();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   async function saveSettings(): Promise<void> {
     setSaving(true);
@@ -521,6 +670,63 @@ function SettingsPage({
       setError(requestError instanceof Error ? requestError.message : "Could not save settings");
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function refreshControls(): Promise<void> {
+    const data = await fetchJson<QuoteControlsResponse>("/api/quotes/controls");
+    setControls(data);
+  }
+
+  async function addAllowlistEntry(): Promise<void> {
+    setSavingAllowlist(true);
+    setControlsError(null);
+    try {
+      await fetchJson<{ saved: boolean }>("/api/quotes/allow", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          quote: {
+            text: allowText,
+            author: allowAuthor || "Unknown",
+            attribution: allowAttribution || "Allowlist",
+          },
+        }),
+      });
+      await refreshControls();
+      setAllowText("");
+      setAllowAuthor("");
+      setAllowAttribution("");
+    } catch (requestError) {
+      setControlsError(requestError instanceof Error ? requestError.message : "Could not add allowlist quote");
+    } finally {
+      setSavingAllowlist(false);
+    }
+  }
+
+  async function removeAllowlistEntry(quoteText: string): Promise<void> {
+    setControlsError(null);
+    try {
+      await fetchJson<{ removed: boolean }>(`/api/quotes/allow?quote=${encodeURIComponent(quoteText)}`, {
+        method: "DELETE",
+      });
+      await refreshControls();
+    } catch (requestError) {
+      setControlsError(requestError instanceof Error ? requestError.message : "Could not remove allowlist quote");
+    }
+  }
+
+  async function unhideQuote(quoteText: string): Promise<void> {
+    setControlsError(null);
+    try {
+      await fetchJson<{ removed: boolean }>(`/api/quotes/hide?quote=${encodeURIComponent(quoteText)}`, {
+        method: "DELETE",
+      });
+      await refreshControls();
+    } catch (requestError) {
+      setControlsError(requestError instanceof Error ? requestError.message : "Could not unhide quote");
     }
   }
 
@@ -582,6 +788,92 @@ function SettingsPage({
         {message ? <p className="mt-3 rounded-xl border border-[#72a283] bg-[#f1fff6] px-3.5 py-2.5 text-[#2f6a45]">{message}</p> : null}
         {error ? <p className="mt-3 rounded-xl border border-[#cb6c60] bg-[#fff0ed] px-3.5 py-2.5 text-[#a1372a]">{error}</p> : null}
       </section>
+
+      <section className={panelClass}>
+        <h3 className="mb-3 mt-0 text-lg" style={{ fontFamily: '"Palatino Linotype", "Book Antiqua", Palatino, serif' }}>
+          Quote Quality Controls
+        </h3>
+        <p className="mt-0 text-sm text-[#6f6256]">
+          Allowlist entries are prioritized in generation. Hidden quotes are excluded from future suggestions.
+        </p>
+
+        {controlsLoading ? <p>Loading controls...</p> : null}
+        {controlsError ? <p className="rounded-xl border border-[#cb6c60] bg-[#fff0ed] px-3.5 py-2.5 text-[#a1372a]">{controlsError}</p> : null}
+
+        <div className="mb-3 grid gap-2 md:grid-cols-3">
+          <input
+            type="text"
+            value={allowText}
+            onChange={(event) => setAllowText(event.target.value)}
+            placeholder="Allowlist quote text"
+            className="rounded-lg border border-[#d5cab6] px-2.5 py-2"
+          />
+          <input
+            type="text"
+            value={allowAuthor}
+            onChange={(event) => setAllowAuthor(event.target.value)}
+            placeholder="Author"
+            className="rounded-lg border border-[#d5cab6] px-2.5 py-2"
+          />
+          <input
+            type="text"
+            value={allowAttribution}
+            onChange={(event) => setAllowAttribution(event.target.value)}
+            placeholder="Attribution"
+            className="rounded-lg border border-[#d5cab6] px-2.5 py-2"
+          />
+        </div>
+        <button
+          type="button"
+          className={cx(uiButtonClass, "mb-4 px-3 py-2 text-sm font-semibold")}
+          disabled={savingAllowlist || !allowText.trim()}
+          onClick={addAllowlistEntry}
+        >
+          {savingAllowlist ? "Adding..." : "Add To Allowlist"}
+        </button>
+
+        <h4 className="mb-2 mt-0 text-base">Allowlist</h4>
+        <div className="mb-4 grid gap-2">
+          {(controls?.allowlistQuotes ?? []).map((quote) => (
+            <div key={quote.text} className="rounded-lg border border-[#d5cab6] bg-[#fffcf5] p-2.5">
+              <p className="m-0">{quote.text}</p>
+              <p className="m-0 text-sm text-[#6f6256]">
+                {quote.author} · {quote.attribution}
+              </p>
+              <button
+                type="button"
+                className={cx(uiButtonClass, "mt-2 px-2.5 py-1.5 text-xs font-semibold")}
+                onClick={() => {
+                  void removeAllowlistEntry(quote.text);
+                }}
+              >
+                Remove
+              </button>
+            </div>
+          ))}
+          {!controlsLoading && (controls?.allowlistQuotes.length ?? 0) === 0 ? <p className="m-0 text-sm text-[#6f6256]">No allowlist quotes yet.</p> : null}
+        </div>
+
+        <h4 className="mb-2 mt-0 text-base">Hidden Quotes</h4>
+        <div className="grid gap-2">
+          {(controls?.hiddenQuotes ?? []).map((entry) => (
+            <div key={entry.normalizedQuote} className="rounded-lg border border-[#d5cab6] bg-[#fffcf5] p-2.5">
+              <p className="m-0">{entry.quote}</p>
+              <p className="m-0 text-sm text-[#6f6256]">Hidden on {formatDate(entry.createdOn)}</p>
+              <button
+                type="button"
+                className={cx(uiButtonClass, "mt-2 px-2.5 py-1.5 text-xs font-semibold")}
+                onClick={() => {
+                  void unhideQuote(entry.quote);
+                }}
+              >
+                Unhide
+              </button>
+            </div>
+          ))}
+          {!controlsLoading && (controls?.hiddenQuotes.length ?? 0) === 0 ? <p className="m-0 text-sm text-[#6f6256]">No hidden quotes.</p> : null}
+        </div>
+      </section>
     </section>
   );
 }
@@ -603,6 +895,7 @@ function HistoryPage({ backgrounds }: { backgrounds: Background[] }) {
   const [error, setError] = useState<string | null>(null);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<number | null>(null);
+  const [hidingQuote, setHidingQuote] = useState<string | null>(null);
   const [clearingAll, setClearingAll] = useState(false);
   const [presentationItem, setPresentationItem] = useState<QuoteHistoryItem | null>(null);
 
@@ -685,6 +978,32 @@ function HistoryPage({ backgrounds }: { backgrounds: Background[] }) {
       setError(requestError instanceof Error ? requestError.message : "Could not clear history");
     } finally {
       setClearingAll(false);
+    }
+  }
+
+  async function hideQuoteFromSuggestions(quoteText: string): Promise<void> {
+    if (!window.confirm("Hide this quote from future suggestions?")) {
+      return;
+    }
+
+    setHidingQuote(quoteText);
+    setActionMessage(null);
+    setError(null);
+
+    try {
+      await fetchJson<{ added: boolean }>("/api/quotes/hide", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ quoteText }),
+      });
+      setItems((current) => current.filter((entry) => entry.quote !== quoteText));
+      setActionMessage("Quote hidden from future suggestions.");
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Could not hide quote");
+    } finally {
+      setHidingQuote(null);
     }
   }
 
@@ -772,12 +1091,22 @@ function HistoryPage({ backgrounds }: { backgrounds: Background[] }) {
                       type="button"
                       className={cx(uiButtonClass, "px-3 py-2 text-sm font-semibold")}
                       aria-label={`Delete entry #${item.id}`}
-                      disabled={deletingId === item.id || clearingAll}
+                      disabled={deletingId === item.id || clearingAll || hidingQuote === item.quote}
                       onClick={() => {
                         void deleteEntry(item);
                       }}
                     >
                       {deletingId === item.id ? "Deleting..." : "Delete Entry"}
+                    </button>
+                    <button
+                      type="button"
+                      className={cx(uiButtonClass, "px-3 py-2 text-sm font-semibold")}
+                      disabled={hidingQuote === item.quote || deletingId === item.id || clearingAll}
+                      onClick={() => {
+                        void hideQuoteFromSuggestions(item.quote);
+                      }}
+                    >
+                      {hidingQuote === item.quote ? "Hiding..." : "Hide Quote"}
                     </button>
                   </div>
                 </div>

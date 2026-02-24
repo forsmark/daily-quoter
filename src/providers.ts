@@ -1,5 +1,13 @@
 import { BACKGROUNDS as FALLBACK_BACKGROUNDS } from "./data/backgrounds";
 import { QUOTES as FALLBACK_QUOTES } from "./data/quotes";
+import {
+  getAllowlistQuotes,
+  getDailyBackgroundCache,
+  getDailyQuoteCache,
+  getHiddenQuoteSet,
+  setDailyBackgroundCache,
+  setDailyQuoteCache,
+} from "./db";
 import type { Background, Quote } from "./types";
 
 const ZENQUOTES_ENDPOINT = "https://zenquotes.io/api/quotes";
@@ -27,8 +35,8 @@ const RECENT_BACKGROUND_MEMORY = 180;
 const PEXELS_MAX_RETRIES = 4;
 const DISABLE_REMOTE_APIS = Bun.env.DISABLE_REMOTE_APIS === "1";
 
-type QuoteSource = "zenquotes" | "fallback";
-type BackgroundSource = "pexels" | "fallback";
+type QuoteSource = "zenquotes" | "fallback" | "cache";
+type BackgroundSource = "pexels" | "fallback" | "cache";
 
 type ZenQuote = {
   q?: string;
@@ -56,6 +64,7 @@ type PexelsSearchResponse = {
 
 let backgroundCache: { expiresAt: number; backgrounds: Background[] } | null = null;
 let recentBackgroundIds: string[] = [];
+let dailyCacheWarmPromise: Promise<void> | null = null;
 
 function normalizeQuote(text: string): string {
   return text.trim().toLowerCase();
@@ -68,6 +77,10 @@ function shuffle<T>(items: T[]): T[] {
     [copy[i], copy[j]] = [copy[j], copy[i]];
   }
   return copy;
+}
+
+function todayKey(): string {
+  return new Date().toISOString().slice(0, 10);
 }
 
 function sanitizeQuote(raw: ZenQuote): Quote | null {
@@ -86,18 +99,52 @@ function sanitizeQuote(raw: ZenQuote): Quote | null {
   };
 }
 
-function pickUnusedQuotes(pool: Quote[], used: Set<string>, count: number): Quote[] {
+function pickUnusedQuotes(
+  pool: Quote[],
+  used: Set<string>,
+  blocked: Set<string>,
+  count: number,
+  preferred: Set<string> = new Set(),
+): Quote[] {
   const seen = new Set<string>();
   const uniqueUnused = pool.filter((quote) => {
     const normalized = normalizeQuote(quote.text);
-    if (!normalized || used.has(normalized) || seen.has(normalized)) {
+    if (!normalized || used.has(normalized) || blocked.has(normalized) || seen.has(normalized)) {
       return false;
     }
     seen.add(normalized);
     return true;
   });
 
-  return shuffle(uniqueUnused).slice(0, count);
+  const preferredQuotes = uniqueUnused.filter((quote) => preferred.has(normalizeQuote(quote.text)));
+  const remainingQuotes = uniqueUnused.filter((quote) => !preferred.has(normalizeQuote(quote.text)));
+
+  return [...shuffle(preferredQuotes), ...shuffle(remainingQuotes)].slice(0, count);
+}
+
+function uniqueQuotes(pool: Quote[]): Quote[] {
+  const seen = new Set<string>();
+  const unique: Quote[] = [];
+
+  for (const quote of pool) {
+    const normalized = normalizeQuote(quote.text);
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    unique.push({
+      text: quote.text.trim(),
+      author: quote.author.trim(),
+      attribution: quote.attribution.trim(),
+      sourceUrl: quote.sourceUrl?.trim() ?? "",
+    });
+  }
+
+  return unique;
+}
+
+function buildQuotePool(primary: Quote[], allowlist: Quote[]): Quote[] {
+  return uniqueQuotes([...allowlist, ...primary]);
 }
 
 async function fetchZenQuotes(): Promise<Quote[]> {
@@ -137,15 +184,18 @@ async function fetchZenQuotes(): Promise<Quote[]> {
   return quotes;
 }
 
-function fallbackQuotes(count: number, used: Set<string>): Quote[] {
-  return pickUnusedQuotes(
-    FALLBACK_QUOTES.map((quote) => ({
-      ...quote,
-      sourceUrl: quote.sourceUrl ?? "",
-    })),
-    used,
-    count,
-  );
+function fallbackQuotes(
+  count: number,
+  used: Set<string>,
+  blocked: Set<string>,
+  allowlist: Quote[],
+  preferred: Set<string>,
+): Quote[] {
+  const fallbackPool = FALLBACK_QUOTES.map((quote) => ({
+    ...quote,
+    sourceUrl: quote.sourceUrl ?? "",
+  }));
+  return pickUnusedQuotes(buildQuotePool(fallbackPool, allowlist), used, blocked, count, preferred);
 }
 
 export async function getQuoteSuggestions(count: number, used: Set<string>): Promise<{
@@ -154,8 +204,25 @@ export async function getQuoteSuggestions(count: number, used: Set<string>): Pro
   source: QuoteSource;
   notice?: string;
 }> {
+  const blocked = getHiddenQuoteSet();
+  const allowlist = getAllowlistQuotes();
+  const preferred = new Set(allowlist.map((quote) => normalizeQuote(quote.text)));
+  const cacheDate = todayKey();
+  const cachedQuotes = getDailyQuoteCache(cacheDate);
+  if (cachedQuotes && cachedQuotes.length > 0) {
+    const fromCache = pickUnusedQuotes(buildQuotePool(cachedQuotes, allowlist), used, blocked, count, preferred);
+    if (fromCache.length > 0) {
+      return {
+        quotes: fromCache,
+        exhausted: false,
+        source: "cache",
+        notice: "Serving today's pre-fetched quote cache.",
+      };
+    }
+  }
+
   if (DISABLE_REMOTE_APIS) {
-    const fallback = fallbackQuotes(count, used);
+    const fallback = fallbackQuotes(count, used, blocked, allowlist, preferred);
     return {
       quotes: fallback,
       exhausted: fallback.length === 0,
@@ -166,7 +233,9 @@ export async function getQuoteSuggestions(count: number, used: Set<string>): Pro
 
   try {
     const zenQuotes = await fetchZenQuotes();
-    const picked = pickUnusedQuotes(zenQuotes, used, count);
+    const pool = buildQuotePool(zenQuotes, allowlist);
+    setDailyQuoteCache(cacheDate, pool);
+    const picked = pickUnusedQuotes(pool, used, blocked, count, preferred);
 
     if (picked.length > 0) {
       return {
@@ -176,7 +245,7 @@ export async function getQuoteSuggestions(count: number, used: Set<string>): Pro
       };
     }
 
-    const fallback = fallbackQuotes(count, used);
+    const fallback = fallbackQuotes(count, used, blocked, allowlist, preferred);
     return {
       quotes: fallback,
       exhausted: fallback.length === 0,
@@ -187,7 +256,7 @@ export async function getQuoteSuggestions(count: number, used: Set<string>): Pro
           : "No unused quotes available from ZenQuotes or fallback pool.",
     };
   } catch {
-    const fallback = fallbackQuotes(count, used);
+    const fallback = fallbackQuotes(count, used, blocked, allowlist, preferred);
     return {
       quotes: fallback,
       exhausted: fallback.length === 0,
@@ -374,6 +443,16 @@ export async function getBackgroundChoices(count: number): Promise<{
   source: BackgroundSource;
   notice?: string;
 }> {
+  const cacheDate = todayKey();
+  const dailyCached = getDailyBackgroundCache(cacheDate);
+  if (dailyCached && dailyCached.length >= count) {
+    return {
+      backgrounds: pickVariedBackgrounds(shuffle(dailyCached), count),
+      source: "cache",
+      notice: "Serving today's pre-fetched background cache.",
+    };
+  }
+
   if (DISABLE_REMOTE_APIS) {
     return {
       backgrounds: fallbackBackgrounds(count),
@@ -384,6 +463,7 @@ export async function getBackgroundChoices(count: number): Promise<{
 
   try {
     const backgrounds = await fetchPexelsBackgrounds(count);
+    setDailyBackgroundCache(cacheDate, backgrounds);
     return {
       backgrounds,
       source: "pexels",
@@ -395,5 +475,45 @@ export async function getBackgroundChoices(count: number): Promise<{
       notice:
         "Pexels unavailable or API key missing. Serving bundled fallback backgrounds for this run.",
     };
+  }
+}
+
+export async function warmDailyCache(quoteCount: number, backgroundCount: number): Promise<void> {
+  if (DISABLE_REMOTE_APIS) {
+    return;
+  }
+
+  if (dailyCacheWarmPromise) {
+    await dailyCacheWarmPromise;
+    return;
+  }
+
+  const cacheDate = todayKey();
+  dailyCacheWarmPromise = (async () => {
+    const quoteCache = getDailyQuoteCache(cacheDate);
+    if (!quoteCache || quoteCache.length < quoteCount) {
+      try {
+        const zenQuotes = await fetchZenQuotes();
+        setDailyQuoteCache(cacheDate, buildQuotePool(zenQuotes, getAllowlistQuotes()));
+      } catch {
+        // Best-effort warmup; runtime requests keep fallback behavior.
+      }
+    }
+
+    const backgroundCacheForDay = getDailyBackgroundCache(cacheDate);
+    if (!backgroundCacheForDay || backgroundCacheForDay.length < backgroundCount) {
+      try {
+        const backgrounds = await fetchPexelsBackgrounds(backgroundCount);
+        setDailyBackgroundCache(cacheDate, backgrounds);
+      } catch {
+        // Best-effort warmup; runtime requests keep fallback behavior.
+      }
+    }
+  })();
+
+  try {
+    await dailyCacheWarmPromise;
+  } finally {
+    dailyCacheWarmPromise = null;
   }
 }

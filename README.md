@@ -12,10 +12,14 @@ A Bun + TypeScript + React app for generating and presenting an inspirational qu
 - Avoids reuse of previously selected quotes
 - Choose a background and font, then preview quote overlay
 - Presentation mode uses an in-app full-viewport overlay (no browser/system fullscreen API)
+- Export selected slide to PNG (`Download PNG`)
 - Persist chosen quote + metadata in local SQLite
 - Settings page for quote count, background count, and default font
 - History page for previously used quotes
-- History actions: delete single entry, delete all entries, and reopen saved slides in presentation overlay
+- History actions: delete single entry, delete all entries, hide quote from future suggestions, and reopen saved slides in presentation overlay
+- Quote quality controls (allowlist + hidden/blacklist management)
+- Daily remote cache warmup for quotes/backgrounds to improve standup-time reliability
+- Structured API logs and `/health` endpoint
 - Unit tests (Bun test) and E2E tests (Playwright)
 
 ## Configuration
@@ -29,6 +33,7 @@ Optional runtime flags:
 
 - `DISABLE_REMOTE_APIS=1` to force local fallback quotes/backgrounds (useful for tests)
 - `DAILY_QUOTER_DB_PATH=/absolute/path/to/db.sqlite` to override default SQLite location
+- `E2E_PORT=NNNN` to force Playwright webServer port (optional for local troubleshooting)
 
 You can copy values into `.env` using `.env.example` as a template.
 
@@ -50,6 +55,12 @@ API runs on [http://localhost:3000](http://localhost:3000) and is proxied by Vit
 ```bash
 bun run build
 bun run serve
+```
+
+Health check:
+
+```bash
+curl http://localhost:3000/health
 ```
 
 ## Testing
@@ -74,7 +85,7 @@ bun run test:e2e
 
 Notes:
 
-- Playwright tests start the full app on `http://127.0.0.1:4173`
+- Playwright tests start the full app on a local high port (or `E2E_PORT` if set)
 - E2E runs with `DISABLE_REMOTE_APIS=1` for deterministic fallback data
 - E2E test artifacts are written to `playwright-report/` and `test-results/`
 
@@ -96,3 +107,8 @@ Notes:
 - Unit tests: `tests/unit/*.test.ts`
 - E2E tests: `tests/e2e/*.spec.ts`
 - Playwright config: `playwright.config.ts`
+
+## CI
+
+- GitHub Actions workflow: `.github/workflows/ci.yml`
+- Runs typecheck, build, unit tests, and Playwright E2E on push/PR to `main`

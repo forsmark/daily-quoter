@@ -1,20 +1,26 @@
 import { existsSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
+  addAllowlistQuote,
+  addHiddenQuote,
   deleteAllQuoteHistory,
   deleteQuoteHistoryEntry,
+  getAllowlistQuotes,
   getBackgroundSuggestionCount,
   getDefaultFontId,
+  getHiddenQuotes,
   getQuoteHistory,
   getQuoteSuggestionCount,
   getUsedQuotes,
+  removeAllowlistQuote,
+  removeHiddenQuote,
   saveQuoteSelection,
   setBackgroundSuggestionCount,
   setDefaultFontId,
   setQuoteSuggestionCount,
 } from "./db";
 import { FONT_OPTIONS } from "./data/fonts";
-import { getBackgroundChoices, getQuoteSuggestions } from "./providers";
+import { getBackgroundChoices, getQuoteSuggestions, warmDailyCache } from "./providers";
 import type { Background, FontChoice, Quote } from "./types";
 
 const DIST_DIR = resolve(process.cwd(), "dist");
@@ -27,6 +33,28 @@ function json(data: unknown, status = 200): Response {
       "cache-control": "no-store",
     },
   });
+}
+
+function logInfo(event: string, data: Record<string, unknown>): void {
+  console.log(
+    JSON.stringify({
+      level: "info",
+      event,
+      timestamp: new Date().toISOString(),
+      ...data,
+    }),
+  );
+}
+
+function logError(event: string, data: Record<string, unknown>): void {
+  console.error(
+    JSON.stringify({
+      level: "error",
+      event,
+      timestamp: new Date().toISOString(),
+      ...data,
+    }),
+  );
 }
 
 function clampQuoteCount(value: number): number {
@@ -214,14 +242,29 @@ const server = Bun.serve({
   port: Number(Bun.env.PORT ?? 3000),
   async fetch(request) {
     const url = new URL(request.url);
+    const startedAt = Date.now();
+    const requestId = crypto.randomUUID();
+
+    function respond(response: Response): Response {
+      logInfo("http_request", {
+        requestId,
+        method: request.method,
+        path: url.pathname,
+        status: response.status,
+        durationMs: Date.now() - startedAt,
+      });
+      return response;
+    }
 
     if (url.pathname === "/api/settings" && request.method === "GET") {
       const defaultFont = FONT_OPTIONS.find((item) => item.id === getDefaultFontId()) ?? FONT_OPTIONS[0];
-      return json({
+      return respond(
+        json({
         quoteSuggestionCount: getQuoteSuggestionCount(),
         backgroundSuggestionCount: getBackgroundSuggestionCount(),
         defaultFontId: defaultFont.id,
-      });
+      }),
+      );
     }
 
     if (url.pathname === "/api/settings" && request.method === "PUT") {
@@ -241,49 +284,53 @@ const server = Bun.serve({
       setBackgroundSuggestionCount(backgroundCount);
       setDefaultFontId(defaultFont.id);
 
-      return json({
+      return respond(
+        json({
         quoteSuggestionCount: quoteCount,
         backgroundSuggestionCount: backgroundCount,
         defaultFontId: defaultFont.id,
-      });
+      }),
+      );
     }
 
     if (url.pathname === "/api/fonts" && request.method === "GET") {
-      return json({
+      return respond(
+        json({
         fonts: FONT_OPTIONS,
-      });
+      }),
+      );
     }
 
     if (url.pathname === "/api/backgrounds" && request.method === "GET") {
       const count = clampBackgroundCount(Number(url.searchParams.get("count") ?? getBackgroundSuggestionCount()));
       const data = await getBackgroundChoices(count);
-      return json(data);
+      return respond(json(data));
     }
 
     if (url.pathname === "/api/background-image" && request.method === "GET") {
       const sourceUrl = url.searchParams.get("src")?.trim() ?? "";
       if (!sourceUrl) {
-        return fallbackImageResponse();
+        return respond(fallbackImageResponse());
       }
 
       try {
         const parsed = new URL(sourceUrl);
         const host = parsed.hostname.toLowerCase();
         if (parsed.protocol !== "https:" || !host.endsWith("images.pexels.com")) {
-          return json({ error: "Invalid image source host" }, 400);
+          return respond(json({ error: "Invalid image source host" }, 400));
         }
 
         const upstream = await fetchImageWithRetry(parsed.toString());
         const contentType = upstream.headers.get("content-type") || "image/jpeg";
-        return new Response(upstream.body, {
+        return respond(new Response(upstream.body, {
           status: 200,
           headers: {
             "content-type": contentType,
             "cache-control": "public, max-age=86400",
           },
-        });
+        }));
       } catch {
-        return fallbackImageResponse();
+        return respond(fallbackImageResponse());
       }
     }
 
@@ -291,7 +338,7 @@ const server = Bun.serve({
       const body = await parseBody<{ count?: number }>(request);
       const count = clampQuoteCount(Number(body?.count ?? getQuoteSuggestionCount()));
       const data = await getQuoteSuggestions(count, getUsedQuotes());
-      return json(data);
+      return respond(json(data));
     }
 
     if (url.pathname === "/api/quotes/choose" && request.method === "POST") {
@@ -301,53 +348,136 @@ const server = Bun.serve({
       const fontPayload = body?.font;
 
       if (!isValidQuote(quotePayload) || !isValidBackground(backgroundPayload) || !isValidFont(fontPayload)) {
-        return json({ error: "Invalid payload" }, 400);
+        return respond(json({ error: "Invalid payload" }, 400));
       }
 
       const selectedFont = FONT_OPTIONS.find((item) => item.id === fontPayload.id);
       if (!selectedFont) {
-        return json({ error: "Unknown font" }, 400);
+        return respond(json({ error: "Unknown font" }, 400));
       }
 
       try {
         const saved = saveQuoteSelection(quotePayload, backgroundPayload, selectedFont);
-        return json({ saved });
+        return respond(json({ saved }));
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown error";
         if (message.includes("UNIQUE")) {
-          return json({ error: "Quote has already been used. Generate new suggestions." }, 409);
+          return respond(json({ error: "Quote has already been used. Generate new suggestions." }, 409));
         }
-        return json({ error: "Failed to save quote selection" }, 500);
+        logError("quote_selection_save_failed", {
+          requestId,
+          error: message,
+        });
+        return respond(json({ error: "Failed to save quote selection" }, 500));
       }
     }
 
     if (url.pathname === "/api/quotes/history" && request.method === "GET") {
       const limit = clampHistoryLimit(Number(url.searchParams.get("limit") ?? 100));
-      return json({ items: getQuoteHistory(limit) });
+      return respond(json({ items: getQuoteHistory(limit) }));
     }
 
     if (url.pathname === "/api/quotes/history" && request.method === "DELETE") {
       const deleted = deleteAllQuoteHistory();
-      return json({ deleted });
+      return respond(json({ deleted }));
     }
 
     const historyDeleteMatch = url.pathname.match(/^\/api\/quotes\/history\/(\d+)$/);
     if (historyDeleteMatch && request.method === "DELETE") {
       const id = Number.parseInt(historyDeleteMatch[1] ?? "", 10);
       if (!Number.isFinite(id) || id < 1) {
-        return json({ error: "Invalid history id" }, 400);
+        return respond(json({ error: "Invalid history id" }, 400));
       }
 
       const deleted = deleteQuoteHistoryEntry(id);
       if (!deleted) {
-        return json({ error: "History entry not found" }, 404);
+        return respond(json({ error: "History entry not found" }, 404));
       }
 
-      return json({ deleted: true });
+      return respond(json({ deleted: true }));
     }
 
-    return serveStatic(url.pathname) ?? new Response("Not found", { status: 404 });
+    if (url.pathname === "/api/quotes/controls" && request.method === "GET") {
+      return respond(
+        json({
+          hiddenQuotes: getHiddenQuotes(),
+          allowlistQuotes: getAllowlistQuotes(),
+        }),
+      );
+    }
+
+    if (url.pathname === "/api/quotes/hide" && request.method === "POST") {
+      const body = await parseBody<{ quoteText?: string }>(request);
+      const quoteText = body?.quoteText?.trim() ?? "";
+      if (!quoteText) {
+        return respond(json({ error: "quoteText is required" }, 400));
+      }
+
+      const added = addHiddenQuote(quoteText);
+      return respond(json({ added }));
+    }
+
+    if (url.pathname === "/api/quotes/hide" && request.method === "DELETE") {
+      const quoteText = url.searchParams.get("quote")?.trim() ?? "";
+      if (!quoteText) {
+        return respond(json({ error: "quote query param is required" }, 400));
+      }
+      return respond(json({ removed: removeHiddenQuote(quoteText) }));
+    }
+
+    if (url.pathname === "/api/quotes/allow" && request.method === "POST") {
+      const body = await parseBody<{ quote?: unknown }>(request);
+      const quotePayload = body?.quote;
+      if (!isValidQuote(quotePayload)) {
+        return respond(json({ error: "Invalid quote payload" }, 400));
+      }
+      return respond(json({ saved: addAllowlistQuote(quotePayload) }));
+    }
+
+    if (url.pathname === "/api/quotes/allow" && request.method === "DELETE") {
+      const quoteText = url.searchParams.get("quote")?.trim() ?? "";
+      if (!quoteText) {
+        return respond(json({ error: "quote query param is required" }, 400));
+      }
+      return respond(json({ removed: removeAllowlistQuote(quoteText) }));
+    }
+
+    if (url.pathname === "/api/cache/warm" && request.method === "POST") {
+      const quoteCount = getQuoteSuggestionCount();
+      const backgroundCount = getBackgroundSuggestionCount();
+      await warmDailyCache(quoteCount, backgroundCount);
+      return respond(json({ warmed: true, quoteCount, backgroundCount }));
+    }
+
+    if (url.pathname === "/health" && request.method === "GET") {
+      return respond(
+        json({
+          status: "ok",
+          uptimeSeconds: Math.round(process.uptime()),
+          now: new Date().toISOString(),
+          version: "0.1.0",
+        }),
+      );
+    }
+
+    return respond(serveStatic(url.pathname) ?? new Response("Not found", { status: 404 }));
   },
 });
 
-console.log(`Daily Quoter is running on http://localhost:${server.port}`);
+logInfo("server_started", {
+  port: server.port,
+  baseUrl: `http://localhost:${server.port}`,
+});
+
+void warmDailyCache(getQuoteSuggestionCount(), getBackgroundSuggestionCount())
+  .then(() => {
+    logInfo("daily_cache_warmup_completed", {
+      quoteCount: getQuoteSuggestionCount(),
+      backgroundCount: getBackgroundSuggestionCount(),
+    });
+  })
+  .catch((error) => {
+    logError("daily_cache_warmup_failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  });

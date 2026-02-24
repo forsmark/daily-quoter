@@ -30,6 +30,28 @@ db.exec(`
   );
 
   CREATE INDEX IF NOT EXISTS idx_quote_history_selected_on ON quote_history(selected_on DESC);
+
+  CREATE TABLE IF NOT EXISTS hidden_quotes (
+    normalized_quote TEXT PRIMARY KEY,
+    quote TEXT NOT NULL,
+    created_on TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS allowlist_quotes (
+    normalized_quote TEXT PRIMARY KEY,
+    quote TEXT NOT NULL,
+    author TEXT NOT NULL,
+    attribution TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    created_on TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS daily_cache (
+    cache_key TEXT PRIMARY KEY,
+    cache_date TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    updated_on TEXT NOT NULL
+  );
 `);
 
 function ensureColumn(table: string, column: string, definition: string): void {
@@ -127,6 +149,167 @@ export function setDefaultFontId(fontId: string): void {
 export function getUsedQuotes(): Set<string> {
   const rows = db.query("SELECT normalized_quote FROM quote_history").all() as Array<{ normalized_quote: string }>;
   return new Set(rows.map((row) => row.normalized_quote));
+}
+
+export function getHiddenQuoteSet(): Set<string> {
+  const rows = db.query("SELECT normalized_quote FROM hidden_quotes").all() as Array<{ normalized_quote: string }>;
+  return new Set(rows.map((row) => row.normalized_quote));
+}
+
+export function getHiddenQuotes(): Array<{ quote: string; normalizedQuote: string; createdOn: string }> {
+  const rows = db
+    .query("SELECT quote, normalized_quote, created_on FROM hidden_quotes ORDER BY created_on DESC")
+    .all() as Array<{ quote: string; normalized_quote: string; created_on: string }>;
+
+  return rows.map((row) => ({
+    quote: row.quote,
+    normalizedQuote: row.normalized_quote,
+    createdOn: row.created_on,
+  }));
+}
+
+export function addHiddenQuote(quoteText: string): boolean {
+  const quote = quoteText.trim();
+  if (!quote) {
+    return false;
+  }
+
+  const normalized = normalizeQuote(quote);
+  const result = db
+    .query(
+      `
+      INSERT INTO hidden_quotes (normalized_quote, quote, created_on)
+      VALUES (?1, ?2, ?3)
+      ON CONFLICT(normalized_quote) DO NOTHING
+    `,
+    )
+    .run(normalized, quote, new Date().toISOString()) as { changes?: number };
+
+  return Number(result.changes ?? 0) > 0;
+}
+
+export function removeHiddenQuote(quoteText: string): boolean {
+  const normalized = normalizeQuote(quoteText);
+  if (!normalized) {
+    return false;
+  }
+
+  const result = db.query("DELETE FROM hidden_quotes WHERE normalized_quote = ?1").run(normalized) as { changes?: number };
+  return Number(result.changes ?? 0) > 0;
+}
+
+export function getAllowlistQuotes(): Quote[] {
+  const rows = db
+    .query(
+      `
+      SELECT quote, author, attribution, source_url
+      FROM allowlist_quotes
+      ORDER BY created_on DESC
+    `,
+    )
+    .all() as Array<{ quote: string; author: string; attribution: string; source_url: string }>;
+
+  return rows.map((row) => ({
+    text: row.quote,
+    author: row.author,
+    attribution: row.attribution,
+    sourceUrl: row.source_url || "",
+  }));
+}
+
+export function addAllowlistQuote(quote: Quote): boolean {
+  const text = quote.text.trim();
+  const author = quote.author.trim();
+  const attribution = quote.attribution.trim();
+  if (!text || !author || !attribution) {
+    return false;
+  }
+
+  const normalized = normalizeQuote(text);
+  const result = db
+    .query(
+      `
+      INSERT INTO allowlist_quotes (
+        normalized_quote,
+        quote,
+        author,
+        attribution,
+        source_url,
+        created_on
+      )
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+      ON CONFLICT(normalized_quote) DO UPDATE SET
+        quote = excluded.quote,
+        author = excluded.author,
+        attribution = excluded.attribution,
+        source_url = excluded.source_url
+    `,
+    )
+    .run(normalized, text, author, attribution, quote.sourceUrl?.trim() ?? "", new Date().toISOString()) as { changes?: number };
+
+  return Number(result.changes ?? 0) > 0;
+}
+
+export function removeAllowlistQuote(quoteText: string): boolean {
+  const normalized = normalizeQuote(quoteText);
+  if (!normalized) {
+    return false;
+  }
+
+  const result = db.query("DELETE FROM allowlist_quotes WHERE normalized_quote = ?1").run(normalized) as { changes?: number };
+  return Number(result.changes ?? 0) > 0;
+}
+
+type DailyCacheKey = "quotes" | "backgrounds";
+
+function getDailyCache<T>(cacheKey: DailyCacheKey, cacheDate: string): T[] | null {
+  const row = db
+    .query("SELECT payload FROM daily_cache WHERE cache_key = ?1 AND cache_date = ?2")
+    .get(cacheKey, cacheDate) as { payload: string } | null;
+
+  if (!row) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(row.payload) as unknown;
+    if (!Array.isArray(parsed)) {
+      return null;
+    }
+    return parsed as T[];
+  } catch {
+    return null;
+  }
+}
+
+function setDailyCache<T>(cacheKey: DailyCacheKey, cacheDate: string, values: T[]): void {
+  const payload = JSON.stringify(values);
+  db.query(
+    `
+      INSERT INTO daily_cache (cache_key, cache_date, payload, updated_on)
+      VALUES (?1, ?2, ?3, ?4)
+      ON CONFLICT(cache_key) DO UPDATE SET
+        cache_date = excluded.cache_date,
+        payload = excluded.payload,
+        updated_on = excluded.updated_on
+    `,
+  ).run(cacheKey, cacheDate, payload, new Date().toISOString());
+}
+
+export function getDailyQuoteCache(cacheDate: string): Quote[] | null {
+  return getDailyCache<Quote>("quotes", cacheDate);
+}
+
+export function setDailyQuoteCache(cacheDate: string, quotes: Quote[]): void {
+  setDailyCache("quotes", cacheDate, quotes);
+}
+
+export function getDailyBackgroundCache(cacheDate: string): Background[] | null {
+  return getDailyCache<Background>("backgrounds", cacheDate);
+}
+
+export function setDailyBackgroundCache(cacheDate: string, backgrounds: Background[]): void {
+  setDailyCache("backgrounds", cacheDate, backgrounds);
 }
 
 export function saveQuoteSelection(quote: Quote, background: Background, font: FontChoice): QuoteHistoryItem {
@@ -246,6 +429,7 @@ export function getQuoteHistory(limit = 60): QuoteHistoryItem[] {
         font_family,
         selected_on
       FROM quote_history
+      WHERE normalized_quote NOT IN (SELECT normalized_quote FROM hidden_quotes)
       ORDER BY selected_on DESC
       LIMIT ?1
     `,
